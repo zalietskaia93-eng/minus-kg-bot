@@ -1,0 +1,1 @@
+worker: python minus_kg_bot.py
