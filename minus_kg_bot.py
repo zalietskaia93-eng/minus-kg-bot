@@ -8,11 +8,14 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 
@@ -25,6 +28,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
+    FSInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -11593,6 +11597,66 @@ async def scheduler_loop(bot: Bot) -> None:
         except Exception:
             logging.exception("Scheduler error")
         await asyncio.sleep(30)
+
+
+def _create_consistent_sqlite_backup(source_path: str, destination_path: str) -> None:
+    """Create and verify a consistent SQLite snapshot while the bot is running."""
+    source = Path(source_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Database file not found: {source}")
+
+    destination = Path(destination_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    source_uri = f"{source.resolve().as_uri()}?mode=ro"
+    source_connection = sqlite3.connect(source_uri, uri=True, timeout=30)
+    destination_connection = sqlite3.connect(destination, timeout=30)
+    try:
+        source_connection.backup(destination_connection)
+        destination_connection.commit()
+
+        result = destination_connection.execute("PRAGMA integrity_check").fetchone()
+        if not result or str(result[0]).lower() != "ok":
+            raise RuntimeError("SQLite integrity check failed")
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+
+@router.message(Command("backup_db"), F.from_user.id == settings.admin_id)
+async def backup_database_handler(message: Message) -> None:
+    """Send the administrator a verified snapshot of the live database."""
+    await message.answer("⏳ Создаю резервную копию базы…")
+
+    timestamp = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d_%H-%M-%S_UTC")
+    filename = f"minus_kg_backup_{timestamp}.sqlite3"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="minus_kg_backup_") as temp_dir:
+            backup_path = Path(temp_dir) / filename
+            await asyncio.to_thread(
+                _create_consistent_sqlite_backup,
+                settings.database_path,
+                str(backup_path),
+            )
+
+            size_mb = backup_path.stat().st_size / (1024 * 1024)
+            await message.answer_document(
+                document=FSInputFile(backup_path, filename=filename),
+                caption=(
+                    "✅ Резервная копия базы готова.\n"
+                    f"Размер: {size_mb:.2f} МБ\n\n"
+                    "Сохраните этот файл в безопасном месте. "
+                    "Он содержит анкеты и записи пользователей."
+                ),
+            )
+    except Exception:
+        logging.exception("Database backup failed")
+        await message.answer(
+            "❌ Не удалось создать резервную копию. "
+            "Откройте Railway → worker → Deployments → View logs "
+            "и пришлите последние строки ошибки."
+        )
 
 
 @router.message(Command("stats"), F.from_user.id == settings.admin_id)
