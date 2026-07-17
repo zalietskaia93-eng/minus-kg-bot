@@ -71,6 +71,22 @@ class MinusKgDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_food_logs_user_date
                     ON food_logs(user_id, local_date);
+                CREATE TABLE IF NOT EXISTS drink_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    drink_code TEXT NOT NULL,
+                    drink_name TEXT NOT NULL,
+                    volume_ml INTEGER NOT NULL,
+                    calories REAL NOT NULL DEFAULT 0,
+                    protein REAL NOT NULL DEFAULT 0,
+                    fat REAL NOT NULL DEFAULT 0,
+                    carbs REAL NOT NULL DEFAULT 0,
+                    counts_as_water INTEGER NOT NULL DEFAULT 0,
+                    logged_at INTEGER NOT NULL,
+                    local_date TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_drink_logs_user_date
+                    ON drink_logs(user_id, local_date, logged_at);
                 CREATE TABLE IF NOT EXISTS photo_analyses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -714,6 +730,74 @@ class MinusKgDatabase:
             )
             await db.commit()
 
+    async def add_drink_log(
+        self,
+        user_id: int,
+        drink_code: str,
+        drink_name: str,
+        volume_ml: int,
+        calories: float,
+        protein: float,
+        fat: float,
+        carbs: float,
+        counts_as_water: bool,
+        local_date: str,
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO drink_logs (
+                    user_id, drink_code, drink_name, volume_ml,
+                    calories, protein, fat, carbs, counts_as_water,
+                    logged_at, local_date
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    drink_code,
+                    drink_name,
+                    int(volume_ml),
+                    max(0.0, float(calories)),
+                    max(0.0, float(protein)),
+                    max(0.0, float(fat)),
+                    max(0.0, float(carbs)),
+                    1 if counts_as_water else 0,
+                    int(time.time()),
+                    local_date,
+                ),
+            )
+            await db.commit()
+
+    async def daily_drink_totals(
+        self,
+        user_id: int,
+        local_date: str,
+    ) -> dict[str, float]:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                SELECT
+                    COALESCE(SUM(volume_ml), 0),
+                    COALESCE(SUM(CASE WHEN counts_as_water = 1 THEN volume_ml ELSE 0 END), 0),
+                    COALESCE(SUM(calories), 0),
+                    COALESCE(SUM(protein), 0),
+                    COALESCE(SUM(fat), 0),
+                    COALESCE(SUM(carbs), 0),
+                    COUNT(*)
+                FROM drink_logs
+                WHERE user_id = ? AND local_date = ?
+                """,
+                (user_id, local_date),
+            )
+            row = await cursor.fetchone()
+            keys = (
+                "fluid_ml", "water_ml", "drink_calories",
+                "drink_protein", "drink_fat", "drink_carbs",
+                "drink_count",
+            )
+            return {key: float(value or 0) for key, value in zip(keys, row)}
+
     async def daily_food_totals(self, user_id: int, local_date: str) -> dict[str, float]:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
@@ -741,7 +825,47 @@ class MinusKgDatabase:
                 "carbs_min", "carbs_max",
                 "food_count",
             )
-            return {key: float(value or 0) for key, value in zip(keys, row)}
+            totals = {
+                key: float(value or 0)
+                for key, value in zip(keys, row)
+            }
+
+            cursor = await db.execute(
+                """
+                SELECT
+                    COALESCE(SUM(volume_ml), 0),
+                    COALESCE(SUM(CASE WHEN counts_as_water = 1 THEN volume_ml ELSE 0 END), 0),
+                    COALESCE(SUM(calories), 0),
+                    COALESCE(SUM(protein), 0),
+                    COALESCE(SUM(fat), 0),
+                    COALESCE(SUM(carbs), 0),
+                    COUNT(*)
+                FROM drink_logs
+                WHERE user_id = ? AND local_date = ?
+                """,
+                (user_id, local_date),
+            )
+            drink_row = await cursor.fetchone()
+            fluid_ml, water_ml, calories, protein, fat, carbs, count = [
+                float(value or 0) for value in drink_row
+            ]
+            totals["calories_min"] += calories
+            totals["calories_max"] += calories
+            totals["protein_min"] += protein
+            totals["protein_max"] += protein
+            totals["fat_min"] += fat
+            totals["fat_max"] += fat
+            totals["carbs_min"] += carbs
+            totals["carbs_max"] += carbs
+            totals.update(
+                {
+                    "fluid_ml": fluid_ml,
+                    "water_ml": water_ml,
+                    "drink_calories": calories,
+                    "drink_count": count,
+                }
+            )
+            return totals
 
     async def photo_analysis_count(self, user_id: int) -> int:
         async with aiosqlite.connect(self.path) as db:
@@ -1355,6 +1479,10 @@ class MinusKgDatabase:
                     "carbs_min": 0.0,
                     "carbs_max": 0.0,
                     "food_count": 0,
+                    "drink_count": 0,
+                    "fluid_ml": 0.0,
+                    "water_ml": 0.0,
+                    "drink_calories": 0.0,
                     "fasting_status": None,
                 },
             )
@@ -1436,6 +1564,41 @@ class MinusKgDatabase:
 
             cursor = await db.execute(
                 """
+                SELECT local_date,
+                       COALESCE(SUM(volume_ml), 0) AS fluid_ml,
+                       COALESCE(SUM(CASE WHEN counts_as_water = 1 THEN volume_ml ELSE 0 END), 0) AS water_ml,
+                       COALESCE(SUM(calories), 0) AS calories,
+                       COALESCE(SUM(protein), 0) AS protein,
+                       COALESCE(SUM(fat), 0) AS fat,
+                       COALESCE(SUM(carbs), 0) AS carbs,
+                       COUNT(*) AS drink_count
+                FROM drink_logs
+                WHERE user_id = ? AND local_date BETWEEN ? AND ?
+                GROUP BY local_date
+                """,
+                (user_id, start_date, end_date),
+            )
+            for row in await cursor.fetchall():
+                target = item(row["local_date"])
+                calories = float(row["calories"] or 0)
+                protein = float(row["protein"] or 0)
+                fat = float(row["fat"] or 0)
+                carbs = float(row["carbs"] or 0)
+                target["calories_min"] += calories
+                target["calories_max"] += calories
+                target["protein_min"] += protein
+                target["protein_max"] += protein
+                target["fat_min"] += fat
+                target["fat_max"] += fat
+                target["carbs_min"] += carbs
+                target["carbs_max"] += carbs
+                target["drink_count"] = int(row["drink_count"] or 0)
+                target["fluid_ml"] = float(row["fluid_ml"] or 0)
+                target["water_ml"] = float(row["water_ml"] or 0)
+                target["drink_calories"] = calories
+
+            cursor = await db.execute(
+                """
                 SELECT local_date, status
                 FROM fasting_daily_logs
                 WHERE user_id = ? AND local_date BETWEEN ? AND ?
@@ -1474,6 +1637,10 @@ class MinusKgDatabase:
                 "carbs_min": 0.0,
                 "carbs_max": 0.0,
                 "food_count": 0,
+                "drink_count": 0,
+                "fluid_ml": 0.0,
+                "water_ml": 0.0,
+                "drink_calories": 0.0,
                 "fasting_status": None,
             },
         )
@@ -1493,6 +1660,19 @@ class MinusKgDatabase:
                 (user_id, local_date),
             )
             result["foods"] = [dict(row) for row in await cursor.fetchall()]
+
+            cursor = await db.execute(
+                """
+                SELECT drink_code, drink_name, volume_ml, calories,
+                       protein, fat, carbs, counts_as_water, logged_at
+                FROM drink_logs
+                WHERE user_id = ? AND local_date = ?
+                ORDER BY logged_at
+                LIMIT 30
+                """,
+                (user_id, local_date),
+            )
+            result["drinks"] = [dict(row) for row in await cursor.fetchall()]
         return result
 
     async def weight_history(
@@ -2109,6 +2289,7 @@ class MinusKgDatabase:
     async def delete_user_data(self, user_id: int) -> None:
         tables_by_user = [
             "food_logs",
+            "drink_logs",
             "photo_analyses",
             "ai_chat_logs",
             "weight_logs",

@@ -125,6 +125,71 @@ PLANS = {
     "half_year": {"days": 180, "stars": 1775, "uah": 1490},
 }
 
+# Average nutrition per 100 ml. Values for packaged drinks vary, so the bot
+# explicitly labels sweet drinks, juice and milk as approximate estimates.
+DRINK_PRESETS = {
+    "water": {
+        "ru": "Вода без газа",
+        "uk": "Вода без газу",
+        "emoji": "💧",
+        "calories": 0.0,
+        "protein": 0.0,
+        "fat": 0.0,
+        "carbs": 0.0,
+        "counts_as_water": True,
+    },
+    "sparkling": {
+        "ru": "Вода с газом без сахара",
+        "uk": "Газована вода без цукру",
+        "emoji": "🫧",
+        "calories": 0.0,
+        "protein": 0.0,
+        "fat": 0.0,
+        "carbs": 0.0,
+        "counts_as_water": True,
+    },
+    "sweet": {
+        "ru": "Сладкий напиток",
+        "uk": "Солодкий напій",
+        "emoji": "🥤",
+        "calories": 42.0,
+        "protein": 0.0,
+        "fat": 0.0,
+        "carbs": 10.5,
+        "counts_as_water": False,
+    },
+    "juice": {
+        "ru": "Сок",
+        "uk": "Сік",
+        "emoji": "🧃",
+        "calories": 45.0,
+        "protein": 0.2,
+        "fat": 0.1,
+        "carbs": 10.5,
+        "counts_as_water": False,
+    },
+    "milk": {
+        "ru": "Молоко",
+        "uk": "Молоко",
+        "emoji": "🥛",
+        "calories": 60.0,
+        "protein": 3.2,
+        "fat": 3.2,
+        "carbs": 4.7,
+        "counts_as_water": False,
+    },
+    "tea": {
+        "ru": "Чай или кофе без сахара",
+        "uk": "Чай або кава без цукру",
+        "emoji": "☕",
+        "calories": 2.0,
+        "protein": 0.1,
+        "fat": 0.0,
+        "carbs": 0.3,
+        "counts_as_water": False,
+    },
+}
+
 
 class Onboarding(StatesGroup):
     language = State()
@@ -150,6 +215,10 @@ class Actions(StatesGroup):
     photo = State()
     ai = State()
     menu_products = State()
+
+
+class DrinkLog(StatesGroup):
+    custom_volume = State()
 
 
 class BodyLog(StatesGroup):
@@ -2772,11 +2841,175 @@ def is_kyiv_timezone_choice(text: str | None) -> bool:
     )
 
 
+def drink_goal_ml(profile: dict) -> int:
+    """A moderate, non-medical hydration orientation based on current weight."""
+    weight = float(profile.get("current_weight_kg") or 0)
+    if weight <= 0:
+        return 2000
+    return int(round(max(1500.0, min(3000.0, weight * 30.0)) / 100.0) * 100)
+
+
+def drink_type_keyboard(language: str) -> InlineKeyboardMarkup:
+    rows = []
+    for code in ("water", "sparkling", "sweet", "juice", "milk", "tea"):
+        preset = DRINK_PRESETS[code]
+        rows.append(
+            [button(
+                f"{preset['emoji']} {preset[language]}",
+                f"drink:type:{code}",
+                ButtonStyle.PRIMARY,
+            )]
+        )
+    rows.append(
+        [button(
+            "⬅️ Головне меню" if language == "uk" else "⬅️ Главное меню",
+            "menu:back",
+            ButtonStyle.SUCCESS,
+        )]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def drink_volume_keyboard(code: str, language: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            button("150 мл", f"drink:volume:{code}:150", ButtonStyle.PRIMARY),
+            button("200 мл", f"drink:volume:{code}:200", ButtonStyle.PRIMARY),
+        ],
+        [
+            button("300 мл", f"drink:volume:{code}:300", ButtonStyle.PRIMARY),
+            button("500 мл", f"drink:volume:{code}:500", ButtonStyle.PRIMARY),
+        ],
+        [button(
+            "✍️ Інший об'єм" if language == "uk" else "✍️ Другой объём",
+            f"drink:custom:{code}",
+            ButtonStyle.SUCCESS,
+        )],
+        [button(
+            "⬅️ Обрати інший напій" if language == "uk" else "⬅️ Выбрать другой напиток",
+            "menu:drink",
+            ButtonStyle.PRIMARY,
+        )],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def drink_values(code: str, volume_ml: int) -> dict[str, float | str | bool]:
+    preset = DRINK_PRESETS[code]
+    factor = volume_ml / 100.0
+    return {
+        "calories": round(float(preset["calories"]) * factor, 1),
+        "protein": round(float(preset["protein"]) * factor, 1),
+        "fat": round(float(preset["fat"]) * factor, 1),
+        "carbs": round(float(preset["carbs"]) * factor, 1),
+        "counts_as_water": bool(preset["counts_as_water"]),
+    }
+
+
+async def save_drink_entry(
+    message: Message,
+    user_id: int,
+    code: str,
+    volume_ml: int,
+) -> None:
+    profile = await db.get_profile(user_id)
+    if not profile_complete(profile):
+        await message.answer("Сначала завершите анкету командой /start.")
+        return
+
+    language = profile.get("language") or "ru"
+    preset = DRINK_PRESETS.get(code)
+    if not preset:
+        await message.answer(
+            "Не вдалося визначити напій." if language == "uk" else "Не удалось определить напиток."
+        )
+        return
+
+    values = drink_values(code, volume_ml)
+    local_date = datetime.now(ZoneInfo(profile["timezone"])).date().isoformat()
+    await db.add_drink_log(
+        user_id=user_id,
+        drink_code=code,
+        drink_name=str(preset[language]),
+        volume_ml=volume_ml,
+        calories=float(values["calories"]),
+        protein=float(values["protein"]),
+        fat=float(values["fat"]),
+        carbs=float(values["carbs"]),
+        counts_as_water=bool(values["counts_as_water"]),
+        local_date=local_date,
+    )
+
+    drink_totals = await db.daily_drink_totals(user_id, local_date)
+    nutrition_totals = await db.daily_food_totals(user_id, local_date)
+    goal = drink_goal_ml(profile)
+    calories_today = nutrition_midpoint(nutrition_totals, "calories")
+    calorie_target = float(profile.get("calorie_target") or 0)
+    calorie_left = calorie_target - calories_today
+    approximate = code in {"sweet", "juice", "milk"}
+
+    if language == "uk":
+        note = (
+            "\n\nℹ️ Калорійність орієнтовна: для точнішого розрахунку "
+            "звіряйтеся з етикеткою напою."
+            if approximate else ""
+        )
+        text = (
+            f"✅ Записано: {preset['emoji']} {preset[language]} — {volume_ml} мл\n"
+            f"🔥 Енергія: приблизно {float(values['calories']):.0f} ккал\n\n"
+            f"🥤 Усієї рідини сьогодні: {drink_totals['fluid_ml']:.0f} із "
+            f"орієнтовних {goal} мл\n"
+            f"💧 Води без цукру: {drink_totals['water_ml']:.0f} мл\n"
+            f"🔥 Калорії з напоїв: {drink_totals['drink_calories']:.0f} ккал\n\n"
+            f"📊 Разом їжа + напої: {calories_today:.0f} із "
+            f"{calorie_target:.0f} ккал\n"
+            f"Залишок до орієнтира: {max(0.0, calorie_left):.0f} ккал"
+            f"{note}\n\n"
+            "Орієнтир рідини не є медичною нормою: спека, активність і стан "
+            "здоров'я можуть змінювати потребу."
+        )
+        add_more = "➕ Додати ще напій"
+        back = "🏠 Головне меню"
+    else:
+        note = (
+            "\n\nℹ️ Калорийность ориентировочная: для более точного расчёта "
+            "сверяйтесь с этикеткой напитка."
+            if approximate else ""
+        )
+        text = (
+            f"✅ Записано: {preset['emoji']} {preset[language]} — {volume_ml} мл\n"
+            f"🔥 Энергия: примерно {float(values['calories']):.0f} ккал\n\n"
+            f"🥤 Всего жидкости сегодня: {drink_totals['fluid_ml']:.0f} из "
+            f"ориентировочных {goal} мл\n"
+            f"💧 Воды без сахара: {drink_totals['water_ml']:.0f} мл\n"
+            f"🔥 Калории из напитков: {drink_totals['drink_calories']:.0f} ккал\n\n"
+            f"📊 Всего еда + напитки: {calories_today:.0f} из "
+            f"{calorie_target:.0f} ккал\n"
+            f"Остаток до ориентира: {max(0.0, calorie_left):.0f} ккал"
+            f"{note}\n\n"
+            "Ориентир жидкости не является медицинской нормой: жара, активность "
+            "и состояние здоровья могут менять потребность."
+        )
+        add_more = "➕ Добавить ещё напиток"
+        back = "🏠 Главное меню"
+
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [button(add_more, "menu:drink", ButtonStyle.SUCCESS)],
+                [button(back, "menu:back", ButtonStyle.PRIMARY)],
+            ]
+        ),
+    )
+
+
 def main_menu(language: str) -> InlineKeyboardMarkup:
     if language == "uk":
         rows = [
             [button("🧾 Моя інформація", "menu:profile", ButtonStyle.PRIMARY), button("⚖️ Записати вагу", "menu:weight", ButtonStyle.SUCCESS)],
             [button("🍽 Порахувати їжу", "menu:food", ButtonStyle.PRIMARY), button("📸 Калорії за фото", "menu:photo", ButtonStyle.SUCCESS)],
+            [button("🥤 Записати напій", "menu:drink", ButtonStyle.SUCCESS)],
             [button("📅 Мій календар", "menu:calendar", ButtonStyle.PRIMARY), button("⏰ Нагадування", "menu:reminders", ButtonStyle.SUCCESS)],
             [button("🕐 Інтервальне харчування", "menu:fasting", ButtonStyle.PRIMARY), button("🥗 Що краще їсти", "menu:foods", ButtonStyle.SUCCESS)],
             [button("🫶 Поговорити з minus_kg", "menu:ai", ButtonStyle.PRIMARY)],
@@ -2788,6 +3021,7 @@ def main_menu(language: str) -> InlineKeyboardMarkup:
         rows = [
             [button("🧾 Моя информация", "menu:profile", ButtonStyle.PRIMARY), button("⚖️ Записать вес", "menu:weight", ButtonStyle.SUCCESS)],
             [button("🍽 Посчитать еду", "menu:food", ButtonStyle.PRIMARY), button("📸 Калории по фото", "menu:photo", ButtonStyle.SUCCESS)],
+            [button("🥤 Записать напиток", "menu:drink", ButtonStyle.SUCCESS)],
             [button("📅 Мой календарь", "menu:calendar", ButtonStyle.PRIMARY), button("⏰ Напоминания", "menu:reminders", ButtonStyle.SUCCESS)],
             [button("🕐 Интервальное питание", "menu:fasting", ButtonStyle.PRIMARY), button("🥗 Что лучше съесть", "menu:foods", ButtonStyle.SUCCESS)],
             [button("🫶 Поговорить с minus_kg", "menu:ai", ButtonStyle.PRIMARY)],
@@ -4568,7 +4802,7 @@ async def calendar_day_handler(callback: CallbackQuery) -> None:
             )
         body_text = " · ".join(body_parts)
 
-    if details.get("food_count"):
+    if details.get("food_count") or details.get("drink_count"):
         food_text = (
             f"≈ {calories:.0f} ккал\n"
             f"Білки / жири / вуглеводи: {protein:.0f}/{fat:.0f}/{carbs:.0f} г"
@@ -4605,10 +4839,34 @@ async def calendar_day_handler(callback: CallbackQuery) -> None:
         if food_rows else ""
     )
 
+    drink_rows = []
+    for row in (details.get("drinks") or [])[:10]:
+        name = str(row.get("drink_name") or "").strip()
+        if name:
+            drink_rows.append(
+                f"• {name} — {int(row.get('volume_ml') or 0)} мл, "
+                f"{float(row.get('calories') or 0):.0f} ккал"
+            )
+    if details.get("drink_count"):
+        drink_text = (
+            f"{details.get('fluid_ml', 0):.0f} мл рідини · "
+            f"{details.get('water_ml', 0):.0f} мл води · "
+            f"{details.get('drink_calories', 0):.0f} ккал"
+            if language == "uk" else
+            f"{details.get('fluid_ml', 0):.0f} мл жидкости · "
+            f"{details.get('water_ml', 0):.0f} мл воды · "
+            f"{details.get('drink_calories', 0):.0f} ккал"
+        )
+        if drink_rows:
+            drink_text += "\n" + "\n".join(drink_rows)
+    else:
+        drink_text = no_data
+
     text = (
         f"{title}\n\n"
         f"⚖️ {weight_title}: {body_text}\n\n"
         f"🍽 {food_title}:\n{food_text}{foods_list}\n\n"
+        f"🥤 {'Рідина' if language == 'uk' else 'Жидкость'}:\n{drink_text}\n\n"
         f"🕐 {fasting_title}: {fast_label}"
     )
 
@@ -5863,6 +6121,142 @@ async def fasting_select(callback: CallbackQuery) -> None:
         )
 
     await callback.answer()
+
+
+@router.callback_query(F.data == "menu:back")
+async def inline_main_menu(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    profile = await db.get_profile(callback.from_user.id)
+    language = profile.get("language") if profile else "ru"
+    if not profile_complete(profile):
+        await callback.answer("Сначала завершите анкету.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.answer(
+        "Головне меню:" if language == "uk" else "Главное меню:",
+        reply_markup=main_menu(language),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:drink")
+async def drink_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    profile = await db.get_profile(callback.from_user.id)
+    language = profile.get("language") if profile else "ru"
+    if not profile_complete(profile):
+        await callback.answer("Сначала завершите анкету.", show_alert=True)
+        return
+    if not access_active(profile):
+        await send_access_expired(callback.message, language)
+        await callback.answer()
+        return
+
+    await state.clear()
+    await callback.message.answer(
+        "🥤 Що ви випили? Оберіть напій, а потім об'єм. "
+        "Вода буде врахована без калорій, а молоко, сік і солодкі напої — "
+        "у денному балансі енергії."
+        if language == "uk" else
+        "🥤 Что вы выпили? Выберите напиток, а затем объём. "
+        "Вода будет учтена без калорий, а молоко, сок и сладкие напитки — "
+        "в дневном балансе энергии.",
+        reply_markup=drink_type_keyboard(language),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drink:type:"))
+async def drink_type_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    code = callback.data.rsplit(":", 1)[-1]
+    profile = await db.get_profile(callback.from_user.id)
+    language = profile.get("language") if profile else "ru"
+    preset = DRINK_PRESETS.get(code)
+    if not preset:
+        await callback.answer("Неизвестный напиток.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.answer(
+        f"{preset['emoji']} {preset[language]}\n\n"
+        + ("Оберіть об'єм:" if language == "uk" else "Выберите объём:"),
+        reply_markup=drink_volume_keyboard(code, language),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drink:volume:"))
+async def drink_volume_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 4 or parts[2] not in DRINK_PRESETS:
+        await callback.answer("Ошибка выбора.", show_alert=True)
+        return
+    try:
+        volume_ml = int(parts[3])
+    except ValueError:
+        await callback.answer("Ошибка объёма.", show_alert=True)
+        return
+    await state.clear()
+    await save_drink_entry(
+        callback.message,
+        callback.from_user.id,
+        parts[2],
+        volume_ml,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drink:custom:"))
+async def drink_custom_volume_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    code = callback.data.rsplit(":", 1)[-1]
+    profile = await db.get_profile(callback.from_user.id)
+    language = profile.get("language") if profile else "ru"
+    if code not in DRINK_PRESETS:
+        await callback.answer("Неизвестный напиток.", show_alert=True)
+        return
+    await state.set_state(DrinkLog.custom_volume)
+    await state.update_data(drink_code=code)
+    await callback.message.answer(
+        "Введіть об'єм у мілілітрах одним числом, наприклад 250."
+        if language == "uk" else
+        "Введите объём в миллилитрах одним числом, например 250."
+    )
+    await callback.answer()
+
+
+@router.message(DrinkLog.custom_volume, F.text)
+async def drink_custom_volume_input(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    profile = await db.get_profile(message.from_user.id)
+    language = profile.get("language") if profile else "ru"
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        volume_ml = int(float(raw))
+    except ValueError:
+        volume_ml = 0
+    if not 30 <= volume_ml <= 3000:
+        await message.answer(
+            "Введіть число від 30 до 3000 мл."
+            if language == "uk" else
+            "Введите число от 30 до 3000 мл."
+        )
+        return
+    data = await state.get_data()
+    code = str(data.get("drink_code") or "")
+    await state.clear()
+    if code not in DRINK_PRESETS:
+        await message.answer(
+            "Не вдалося визначити напій. Відкрийте меню ще раз."
+            if language == "uk" else
+            "Не удалось определить напиток. Откройте меню ещё раз."
+        )
+        return
+    await save_drink_entry(message, message.from_user.id, code, volume_ml)
 
 
 @router.callback_query(F.data == "menu:food")
